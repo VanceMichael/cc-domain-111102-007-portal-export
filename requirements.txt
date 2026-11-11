@@ -1,0 +1,11 @@
+# 浏览器自动化依赖（门户 portal.py 与纯单元测试仅用标准库，无需安装）
+#
+# 版本固定在 1.56.0，因为离线/受限网络环境下 Chromium 由系统预置
+# （chromium-1194）；Playwright 与浏览器构建号必须匹配，更新版本会尝试
+# 从 cdn.playwright.dev 下载新浏览器，在受限网络中会 403 失败。
+#
+# 安装：
+#   pip install -r requirements.txt
+#   # 浏览器已预置时无需再下载；全新环境执行：
+#   python -m playwright install chromium
+playwright==1.56.0

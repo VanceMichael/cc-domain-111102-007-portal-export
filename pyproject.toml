@@ -1,6 +1,13 @@
 [project]
 name = "portal-export"
 version = "0.1.0"
-description = "采集来源与资料读取工具"
+description = "授权门户公开服务目录的浏览器自动化采集（只读、可恢复、证据可追溯）"
 requires-python = ">=3.12"
 dependencies = []
+
+[project.optional-dependencies]
+# 浏览器自动化所需；版本与系统预置 chromium-1194 配套，详见 requirements.txt
+browser = ["playwright==1.56.0"]
+
+[tool.unittest]
+start-dir = "tests"

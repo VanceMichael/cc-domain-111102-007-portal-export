@@ -2,11 +2,18 @@ import argparse
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import os
 from pathlib import Path
+import sys
 import threading
 from urllib.parse import parse_qs, urlparse
 import uuid
 
+# 支持以 `python -I portal.py` 从任意工作目录启动：显式把仓库根加入路径，
+# 不依赖 cwd 隐式注入，避免下载目录中的同名模块被导入。
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from app.captcha import CaptchaStore
 from app.catalogue import export_csv, load_catalogues
 
 
@@ -23,7 +30,23 @@ class PortalState:
         temp.replace(self.path)
 
 
-def handler_for(state, catalogues):
+LOGIN_PAGE = '''<!doctype html><meta charset="utf-8"><title>本地演示门户登录</title>
+<h1>本地演示门户</h1>
+<p style="color:#a00">{error}</p>
+<form method="post" action="/login">
+  <input type="hidden" name="cid" value="{cid}">
+  <p><label>演示账号 <input name="username" autocomplete="username" value="{username}"></label></p>
+  <p><label>密码 <input name="password" type="password" autocomplete="current-password"></label></p>
+  <p><label>图形验证码 <input name="captcha" autocomplete="off" maxlength="4"></label>
+     <img src="/captcha/{cid}.bmp" alt="验证码图片" width="{cw}" height="{ch}"></p>
+  <button>演示登录</button>
+</form>
+<p><small>账号密码仅用于本地演示；验证码由人工识别，采集流程不会尝试绕过。</small></p>'''
+
+
+def handler_for(state, catalogues, captchas, credentials):
+    demo_user, demo_password = credentials
+
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
             pass
@@ -48,11 +71,28 @@ def handler_for(state, catalogues):
         def authorized(self):
             return self.session() in state.data["sessions"]
 
+        def login_form(self, error="", username=""):
+            cid, _ = captchas.issue()
+            return LOGIN_PAGE.format(error=error, username=username, cid=cid, cw=188, ch=50)
+
         def do_GET(self):
             path = urlparse(self.path).path
             with state.lock:
                 if path == "/login":
-                    return self.send(200, '<meta charset="utf-8"><h1>本地演示门户</h1><form method="post" action="/login"><button>演示登录</button></form>')
+                    return self.send(200, self.login_form())
+                if path.startswith("/captcha/"):
+                    cid = path.rsplit("/", 1)[-1].removesuffix(".bmp")
+                    image = captcha_images.get(cid)
+                    if image is None:
+                        return self.send(404, "验证码不存在或已过期")
+                    return self.send(200, image, "image/bmp",
+                                     {"Cache-Control": "no-store"})
+                if path.startswith("/test/captcha/"):
+                    cid = path.rsplit("/", 1)[-1]
+                    answer = captchas.test_answer(cid)
+                    if answer is None:
+                        return self.send(404, "not available")
+                    return self.send(200, answer, "text/plain")
                 if path == "/expire":
                     state.data["sessions"] = [s for s in state.data["sessions"] if s != self.session()]
                     state.save()
@@ -89,10 +129,23 @@ def handler_for(state, catalogues):
             body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
             with state.lock:
                 if path == "/login":
+                    fields = parse_qs(body.decode())
+                    username = fields.get("username", [""])[0]
+                    password = fields.get("password", [""])[0]
+                    cid = fields.get("cid", [""])[0]
+                    guess = fields.get("captcha", [""])[0]
+                    ok_user = username == demo_user and password == demo_password
+                    ok_captcha = captchas.verify(cid, guess)
+                    if not (ok_user and ok_captcha):
+                        reason = "账号或密码错误" if not ok_user else "验证码错误或已过期"
+                        return self.send(401, self.login_form(reason, username))
                     sid = uuid.uuid4().hex
                     state.data["sessions"].append(sid)
                     state.save()
-                    return self.send(303, b"", headers={"Location": "/workspace", "Set-Cookie": f"venue_session={sid}; HttpOnly; SameSite=Lax; Path=/"})
+                    return self.send(303, b"", headers={
+                        "Location": "/workspace",
+                        "Set-Cookie": f"venue_session={sid}; HttpOnly; SameSite=Lax; Path=/",
+                    })
                 if not self.authorized():
                     return self.send(401, '{"error":"session_expired"}', "application/json")
                 if path == "/export":
@@ -109,6 +162,23 @@ def handler_for(state, catalogues):
                     return self.send(200, json.dumps(job), "application/json")
                 self.send(404, "页面不存在")
     return Handler
+
+
+# 登录表单需要引用刚签发的验证码图片，进程内短期缓存即可。
+captcha_images: dict[str, bytes] = {}
+
+
+class ImageCaptchaStore(CaptchaStore):
+    """签发验证码时缓存位图，供 /captcha/<id>.bmp 读取。"""
+
+    def issue(self):
+        cid, image = super().issue()
+        captcha_images[cid] = image
+        # 控制缓存规模，与验证码 TTL 同量级清理。
+        if len(captcha_images) > 200:
+            for old_cid in list(captcha_images)[:100]:
+                captcha_images.pop(old_cid, None)
+        return cid, image
 
 
 FRAME = '''<!doctype html><meta charset="utf-8"><h2>公开服务目录</h2>
@@ -132,6 +202,7 @@ document.querySelector('#refresh').onclick = render;
 document.querySelector('#export').onsubmit = async event => {
   event.preventDefault();
   const response = await fetch('/export', {method:'POST',body:new URLSearchParams(new FormData(event.target))});
+  if (response.status === 401) { document.querySelector('#message').textContent = '登录已失效，请重新登录'; return; }
   if (!response.ok) { document.querySelector('#message').textContent = '导出请求未成功'; return; }
   const job = await response.json(); document.querySelector('#message').textContent = '已创建任务 ' + job.id;
   // 重建表单节点，模拟门户局部刷新。
@@ -147,9 +218,21 @@ def main():
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--state", type=Path, default=Path("runtime/portal.json"))
+    parser.add_argument("--test-mode", action="store_true",
+                        help="开放测试用验证码答案接口 /test/captcha/，仅供本地自动化回归")
+    parser.add_argument("--user", default=os.environ.get("PORTAL_DEMO_USER", "demo"))
+    parser.add_argument("--password", default=os.environ.get("PORTAL_DEMO_PASSWORD", "demo12345"))
     args = parser.parse_args()
-    server = ThreadingHTTPServer((args.host, args.port), handler_for(PortalState(args.state), load_catalogues()))
+
+    captchas = ImageCaptchaStore(test_mode=args.test_mode)
+    server = ThreadingHTTPServer(
+        (args.host, args.port),
+        handler_for(PortalState(args.state), load_catalogues(), captchas, (args.user, args.password)),
+    )
     print(f"本地门户：http://{args.host}:{server.server_port}/login", flush=True)
+    print(f"演示账号：{args.user} / {args.password}（仅本地演示）", flush=True)
+    if args.test_mode:
+        print("测试模式：/test/captcha/<id> 可读取验证码答案", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
