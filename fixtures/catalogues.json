@@ -1,0 +1,26 @@
+{
+  "museum-a": {
+    "zh": [
+      {
+        "service": "合成讲解"
+      }
+    ],
+    "en": [
+      {
+        "service": "Synthetic tour"
+      }
+    ]
+  },
+  "museum-b": {
+    "zh": [
+      {
+        "service": "合成展厅"
+      }
+    ],
+    "en": [
+      {
+        "service": "Synthetic gallery"
+      }
+    ]
+  }
+}
